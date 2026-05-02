@@ -278,6 +278,7 @@ void flashFlushB1();
 void b1AddRecord(float mag, uint16_t timeDiff, uint16_t rtcTime, uint8_t status);
 void b1AddMarker(uint8_t h1, uint8_t h2, uint8_t* payload, uint8_t payloadLen);
 void flashFlushPartialB1();
+void imuSendMarker(uint8_t h1, uint8_t h2, uint8_t* payload, uint8_t payloadLen);
 uint16_t flashGetRTCTime();
 void b2TransferToFlash();
 void flashAnxietyFullHandler();
@@ -1337,6 +1338,23 @@ void b2SendPacket() {
   b2_fill = 0;
 }
 
+// Send a marker packet over the IMU characteristic (live anxiety path).
+// Format mirrors the 9-byte B1 record: [h1][h2][payload 0..6], zero-padded.
+void imuSendMarker(uint8_t h1, uint8_t h2, uint8_t* payload,
+                   uint8_t payloadLen) {
+  uint8_t markerBuf[B1_RECORD_SIZE];
+  memset(markerBuf, 0, B1_RECORD_SIZE);
+  markerBuf[0] = h1;
+  markerBuf[1] = h2;
+  if (payload && payloadLen > 0) {
+    uint8_t maxPay = B1_RECORD_SIZE - 2;
+    if (payloadLen > maxPay) payloadLen = maxPay;
+    memcpy(&markerBuf[2], payload, payloadLen);
+  }
+  imuCharacteristic->setValue(markerBuf, B1_RECORD_SIZE);
+  imuCharacteristic->notify();
+}
+
 // Transfer B2 anxiety buffer to flash on disconnect (Phase 5)
 void b2TransferToFlash() {
   if (b2_fill == 0) return;
@@ -1760,6 +1778,19 @@ void loop() {
           forceRedraw = true;
           Serial.printf("MODE: Switched to %s  threshold=%.0f\n",
                         getModeString(), current_ACCL_NOISE_THRESHOLD);
+
+          // If we just switched to ANXIETY while BLE is already connected and
+          // there is unsynced flash data, start a sync session immediately.
+          // (Mirrors the onConnect() check that was missed on first connection.)
+          if (currentMode == MODE_ANXIETY && wasConnected &&
+              sync_read_offset < flash_write_offset) {
+            sync_mark_offset = flash_write_offset;
+            sync_pending     = true;
+            syncState        = SYNC_STARTING;
+            flashSaveConfig();
+            Serial.printf("SYNC: Mode-switch anxiety on-connect — syncing %lu bytes\n",
+                          sync_mark_offset - sync_read_offset);
+          }
         }
       }
 
@@ -1902,11 +1933,10 @@ void loop() {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // STREAM 2: Mode-Aware Output (runs when circular buffer is filled)
+  // STREAM 2: Mode-Aware Output (runs once per 10ms sample, after buffer fills)
   // ══════════════════════════════════════════════════════════════════════════
 
-  if (doSample && bufferFilled)
-  {
+  if (doSample && bufferFilled) {
     // Tremor detection — runs ALWAYS regardless of mode or connection
     float Amag_Baseline = calculateBaseline(Accel_Mag, currentTime);
     crossingCount_Amag  = countCrossings(Accel_Mag, Amag_Baseline,
@@ -1930,8 +1960,11 @@ void loop() {
         tremor_count++;
       }
 
-      // Write START marker to flash path (not sent live over BLE in anxiety mode)
-      if (!(currentMode == MODE_ANXIETY && wasConnected)) {
+      // Write START marker: live anxiety path notifies via IMU UUID;
+      // all other paths write to flash via B1.
+      if (currentMode == MODE_ANXIETY && wasConnected) {
+        imuSendMarker(MARKER_TREMOR_START_H1, MARKER_TREMOR_START_H2, NULL, 0);
+      } else {
         b1AddMarker(MARKER_TREMOR_START_H1, MARKER_TREMOR_START_H2, NULL, 0);
       }
 
@@ -1959,9 +1992,17 @@ void loop() {
         b2SendPacket();
       }
 
-      // Tremor Expiration (anxiety live path — no flash marker)
+      // Tremor Expiration (anxiety live path — end + zero markers via IMU UUID)
       if (inTremorWindow &&
           (millis() - tremorWindowStartMs > BLE_DURATION)) {
+        uint8_t endPayload[4];
+        uint16_t tc  = (uint16_t)tremor_count;
+        uint16_t tdc = (uint16_t)tremor_data_count;
+        memcpy(&endPayload[0], &tc,  2);
+        memcpy(&endPayload[2], &tdc, 2);
+        imuSendMarker(MARKER_TREMOR_END_H1, MARKER_TREMOR_END_H2,
+                      endPayload, 4);
+        imuSendMarker(MARKER_ZERO_H1, MARKER_ZERO_H2, NULL, 0);
         inTremorWindow    = false;
         tremor_data_count = 1;
       }
