@@ -34,7 +34,7 @@
 // ── Timing ───────────────────────────────────────────────────────────────────
 #define SAMPLE_INTERVAL_MS        10
 // #define T1_INTERVAL_MS            (15UL * 60UL * 1000UL)
-#define T1_INTERVAL_MS            (3UL * 60UL * 1000UL)
+#define T1_INTERVAL_MS            (15UL * 60UL * 1000UL)
 #define T2_SYNC_INTERVAL_MS       50
 #define BLE_DURATION              (30UL * 1000UL)
 
